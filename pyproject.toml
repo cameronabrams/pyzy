@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyzy"
+version = "0.1.0"
+description = "zyBooks grade processing tools"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "pyyaml",
+]
+
+[project.scripts]
+pyzy = "pyzy.cli:main"
