@@ -188,7 +188,7 @@ def merge_grades_from_assignments(lecture_files, assignment_files, verbose=True)
                     username_map[username] = idx
 
             if abbrev_name not in lecture_df.columns:
-                lecture_df[abbrev_name] = ''
+                lecture_df[abbrev_name] = float('nan')
                 if abbrev_name not in results['new_columns']:
                     results['new_columns'].append(abbrev_name)
                 if verbose:
