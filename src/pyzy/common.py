@@ -101,6 +101,98 @@ def find_email_column(df):
     return None
 
 
+def find_name_columns(df):
+    """
+    Find first-name and last-name columns in a DataFrame.
+
+    Returns:
+        (first_col, last_col) — either may be None if not found.
+    """
+    first_col = None
+    last_col = None
+    for col in df.columns:
+        cl = col.lower()
+        if 'first' in cl and 'name' in cl:
+            first_col = col
+        elif 'last' in cl and 'name' in cl:
+            last_col = col
+    return first_col, last_col
+
+
+def build_student_score_maps(student_df, score_col):
+    """
+    Build username, student-ID, and name lookup maps from a student DataFrame.
+
+    Args:
+        student_df: DataFrame with student data
+        score_col: Column name containing the score to map
+
+    Returns:
+        (username_map, id_map, name_map) where:
+        - username_map: {username_str: score}
+        - id_map:       {student_id_str: score}  (empty if no ID column found)
+        - name_map:     {(last_lower, first_lower): score}  (empty if no name columns found)
+    """
+    username_map = {}
+    id_map = {}
+    name_map = {}
+
+    email_col = find_email_column(student_df)
+    id_col = find_student_id_column(student_df)
+    first_col, last_col = find_name_columns(student_df)
+
+    for _, row in student_df.iterrows():
+        score = row.get(score_col)
+        if pd.isna(score):
+            continue
+
+        if email_col:
+            username = extract_username_from_email(row[email_col])
+            if username:
+                username_map[username] = score
+
+        if id_col:
+            student_id = normalize_student_id(row[id_col])
+            if student_id:
+                id_map[student_id] = score
+
+        if first_col and last_col:
+            first = str(row[first_col]).strip().lower() if pd.notna(row[first_col]) else ''
+            last = str(row[last_col]).strip().lower() if pd.notna(row[last_col]) else ''
+            if first and last:
+                name_map[(last, first)] = score
+
+    return username_map, id_map, name_map
+
+
+def resolve_column(df, pattern):
+    """
+    Find the unique gradebook column whose name contains *pattern* as a substring.
+
+    Args:
+        df: Gradebook DataFrame
+        pattern: Minimal substring identifying the target column
+
+    Returns:
+        Full column name string
+
+    Raises:
+        ValueError: If no column matches, or more than one column matches.
+    """
+    matches = [col for col in df.columns if pattern in col]
+    if len(matches) == 0:
+        raise ValueError(
+            f"No gradebook column contains '{pattern}'.\n"
+            f"Available columns: {', '.join(df.columns)}"
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"Pattern '{pattern}' is ambiguous — matches {len(matches)} columns: "
+            f"{', '.join(matches)}"
+        )
+    return matches[0]
+
+
 def parse_assignment_filename(filename):
     """
     Parse assignment name from zyBooks filename.

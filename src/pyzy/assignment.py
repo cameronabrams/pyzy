@@ -1,7 +1,6 @@
 """
-Batch Assignment Deadline Lift Merger - processes assignment pairs from
-before/after deadline lift directories and generates consolidated audit
-and true zeros reports.
+Assignment scorer - processes assignment pairs from before/after deadline lift
+directories and generates consolidated audit and true zeros reports.
 """
 
 import re
@@ -359,167 +358,273 @@ def merge_single_assignment(before_file, after_file, assignment_name,
     return merged_df, audit_records, true_zero_records
 
 
-def run_score(deadline_dir, lifted_dir, output_dir='merged',
-              adjustments_file=None, quiet=False):
+def _process_deadline_only(deadline_file, assignment_name, verbose=True):
     """
-    Run the score (deadline-lift merge) workflow.
+    Process a single deadline-only assignment (no lifted version available).
+
+    Returns:
+        Tuple of (df, audit_records, true_zero_records)
+        audit_records is always empty; true_zero_records lists students with score 0.
+    """
+    if verbose:
+        print(f"\nProcessing: {assignment_name}")
+        print(f"   Deadline file: {deadline_file.name}")
+
+    df = read_csv_with_trailing_comma_fix(deadline_file)
+
+    id_col = find_student_id_column(df)
+    email_col = find_email_column(df)
+
+    score_col = None
+    for col in df.columns:
+        if 'percent score' in col.lower():
+            score_col = col
+            break
+
+    due_date_col = None
+    score_date_col = None
+    for col in df.columns:
+        if 'due date' in col.lower():
+            due_date_col = col
+        elif 'score date' in col.lower():
+            score_date_col = col
+
+    if verbose:
+        print(f"   Total students: {len(df)}")
+
+    true_zero_records = []
+
+    if score_col and id_col:
+        for _, row in df.iterrows():
+            if row[score_col] == 0:
+                first_name = ''
+                last_name = ''
+                for col in row.index:
+                    if 'first' in col.lower() and 'name' in col.lower():
+                        first_name = str(row[col]) if pd.notna(row[col]) else ''
+                    elif 'last' in col.lower() and 'name' in col.lower():
+                        last_name = str(row[col]) if pd.notna(row[col]) else ''
+                true_zero_records.append({
+                    'Assignment': assignment_name,
+                    'Last Name': last_name,
+                    'First Name': first_name,
+                    'Student ID': normalize_student_id(row[id_col]),
+                    'Due Date': row[due_date_col] if due_date_col else '',
+                    'Score Date': row[score_date_col] if score_date_col else '',
+                    'School Email': row[email_col] if email_col else '',
+                })
+
+    if verbose:
+        print(f"   True zeros: {len(true_zero_records)}")
+
+    return df, [], true_zero_records
+
+
+def run_assignment(deadline_input, lifted_input=None, lecture_files=None,
+                   output_dir='.', adjustments_file=None, quiet=False):
+    """
+    Run the assignment scoring workflow.
+
+    deadline_input and lifted_input may each be a single CSV file or a directory.
+    Mixing types (file + directory) is an error.
 
     Args:
-        deadline_dir: Directory with original-deadline CSVs
-        lifted_dir: Directory with lifted-deadline CSVs
-        output_dir: Output directory for merged files
+        deadline_input: CSV file or directory with original-deadline CSVs
+        lifted_input: CSV file or directory with lifted-deadline CSVs (optional)
+        lecture_files: Gradebook CSV files to update with scored grades (optional)
+        output_dir: Directory for output files (default: current directory)
         adjustments_file: YAML file with score adjustments (optional)
         quiet: Suppress verbose output
     """
-    deadline_path = Path(deadline_dir)
-    lifted_path = Path(lifted_dir)
+    deadline_path = Path(deadline_input)
 
     if not deadline_path.exists():
-        print(f"ERROR: Deadline directory not found: {deadline_dir}")
+        print(f"ERROR: Not found: {deadline_input}")
         sys.exit(1)
 
-    if not lifted_path.exists():
-        print(f"ERROR: Lifted directory not found: {lifted_dir}")
-        sys.exit(1)
+    deadline_is_file = deadline_path.is_file()
+    deadline_only = lifted_input is None
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    if not deadline_only:
+        lifted_path = Path(lifted_input)
+        if not lifted_path.exists():
+            print(f"ERROR: Not found: {lifted_input}")
+            sys.exit(1)
+        lifted_is_file = lifted_path.is_file()
 
-    print("\nBatch Assignment Deadline Lift Merger")
+        if deadline_is_file != lifted_is_file:
+            print("ERROR: --deadline and --lifted must both be files or both be directories.")
+            sys.exit(1)
+
+    print("\nAssignment Scorer")
     print("=" * 60)
 
-    matches = match_files_between_directories(deadline_dir, lifted_dir)
-
-    if len(matches) == 0:
-        print(f"\nERROR: No matching files found between directories")
-        print(f"   Deadline dir: {len(list(deadline_path.glob('*.csv')))} CSV files")
-        print(f"   Lifted dir: {len(list(lifted_path.glob('*.csv')))} CSV files")
-        sys.exit(1)
-
-    print(f"\nFound {len(matches)} matching assignment pairs")
+    if deadline_only:
+        if deadline_is_file:
+            work_items = [(deadline_path, None, parse_assignment_filename_short(deadline_path.name))]
+            print(f"\nSingle file (deadline only; no modifications): {deadline_path.name}")
+        else:
+            deadline_csvs = sorted(deadline_path.glob('*.csv'))
+            if not deadline_csvs:
+                print(f"\nERROR: No CSV files found in: {deadline_input}")
+                sys.exit(1)
+            work_items = [
+                (f, None, parse_assignment_filename_short(f.name))
+                for f in deadline_csvs
+            ]
+            print(f"\nFound {len(work_items)} file(s) in deadline directory (no modifications).")
+    else:
+        if deadline_is_file:
+            assignment_name = parse_assignment_filename_short(deadline_path.name)
+            work_items = [(deadline_path, lifted_path, assignment_name)]
+            print(f"\nSingle assignment pair: {deadline_path.name} + {lifted_path.name}")
+        else:
+            work_items = match_files_between_directories(deadline_input, lifted_input)
+            if not work_items:
+                print(f"\nERROR: No matching files found between directories")
+                print(f"   Deadline dir: {len(list(deadline_path.glob('*.csv')))} CSV files")
+                print(f"   Lifted dir: {len(list(Path(lifted_input).glob('*.csv')))} CSV files")
+                sys.exit(1)
+            print(f"\nFound {len(work_items)} matching assignment pair(s)")
 
     adjustments = None
-    if adjustments_file:
-        adj_path = Path(adjustments_file)
-        if not adj_path.exists():
-            print(f"ERROR: Adjustments file not found: {adjustments_file}")
-            sys.exit(1)
-        with open(adj_path, 'r', encoding='utf-8') as f:
-            adjustments = yaml.safe_load(f)
-        print(f"Loaded adjustments from: {adjustments_file}")
-    else:
-        print("No adjustments file specified; late penalties will not be applied.")
+    if not deadline_only:
+        if adjustments_file:
+            adj_path = Path(adjustments_file)
+            if not adj_path.exists():
+                print(f"ERROR: Adjustments file not found: {adjustments_file}")
+                sys.exit(1)
+            with open(adj_path, 'r', encoding='utf-8') as f:
+                adjustments = yaml.safe_load(f)
+            print(f"Loaded adjustments from: {adjustments_file}")
+        else:
+            print("No adjustments file specified; late penalties will not be applied.")
+    elif adjustments_file:
+        print("WARNING: --adjustments ignored when --lifted is not provided.")
 
+    verbose = not quiet
     all_audit_records = []
-    all_true_zero_records = []
-    processed_assignments = []
+    processed = []  # list of (assignment_name, merged_df)
 
-    for deadline_file, lifted_file, assignment_name in matches:
+    for deadline_file, lifted_file, assignment_name in work_items:
         try:
-            merged_df, audit_records, true_zero_records = merge_single_assignment(
-                deadline_file,
-                lifted_file,
-                assignment_name,
-                adjustments=adjustments,
-                verbose=not quiet,
-            )
-
-            merged_filename = f"{assignment_name}_merged.csv"
-            merged_path = out / merged_filename
-            merged_df.to_csv(merged_path, index=False, encoding='utf-8-sig')
-
+            if deadline_only:
+                merged_df, audit_records, _ = _process_deadline_only(
+                    deadline_file, assignment_name, verbose=verbose,
+                )
+            else:
+                merged_df, audit_records, _ = merge_single_assignment(
+                    deadline_file, lifted_file, assignment_name,
+                    adjustments=adjustments, verbose=verbose,
+                )
             all_audit_records.extend(audit_records)
-            all_true_zero_records.extend(true_zero_records)
-            processed_assignments.append(assignment_name)
-
+            processed.append((assignment_name, merged_df))
         except Exception as e:
             print(f"\n   ERROR processing {assignment_name}: {e}")
             continue
 
     print("\n" + "=" * 60)
-    print("BATCH MERGE COMPLETE")
+    print("ASSIGNMENT SCORING COMPLETE")
     print("=" * 60)
 
-    print(f"\nProcessed {len(processed_assignments)} assignments:")
-    for assignment in processed_assignments:
-        print(f"   - {assignment}")
+    print(f"\nProcessed {len(processed)} assignment(s):")
+    for name, _ in processed:
+        print(f"   - {name}")
 
-    audit_df = pd.DataFrame()
-    if len(all_audit_records) > 0:
+    out = Path(output_dir)
+
+    if all_audit_records:
+        out.mkdir(parents=True, exist_ok=True)
         audit_df = pd.DataFrame(all_audit_records)
         audit_path = out / 'all_late_submissions.csv'
         audit_df.to_csv(audit_path, index=False, encoding='utf-8-sig')
-
-        print(f"\nConsolidated audit report: {audit_path}")
-        print(f"   Total late submissions: {len(audit_df)}")
-
-        print(f"\n   Late submissions by assignment:")
-        for assignment in processed_assignments:
-            count = len(audit_df[audit_df['Assignment'] == assignment])
+        print(f"\nLate submissions: {len(audit_df)} record(s) -> {audit_path}")
+        for name, _ in processed:
+            count = len(audit_df[audit_df['Assignment'] == name])
             if count > 0:
-                print(f"      {assignment}: {count}")
+                print(f"   {name}: {count}")
     else:
-        print(f"\n   No late submissions found")
+        print("\nNo late submissions.")
 
-    for assignment in processed_assignments:
-        merged_path = out / f'{assignment}_merged.csv'
-        assignment_data = pd.read_csv(merged_path, header=0, encoding='utf-8-sig')
-        assignment_data['Username'] = assignment_data['School email'].str.replace(
-            '@drexel.edu', '', regex=False
-        )
+    if lecture_files and processed:
+        from .activity import apply_scores_to_gradebook
+        from .common import build_student_score_maps
+        from .merge import find_username_column, sort_assignment_columns
 
-        if not audit_df.empty:
-            this_lates = audit_df[audit_df['Assignment'] == assignment]
-            for row, late in this_lates.iterrows():
-                student_id = int(late['Student ID'])
-                score = late['Applied Score']
-                assignment_data.loc[
-                    assignment_data['Student ID'] == student_id, 'Percent score'
-                ] = score
-            scored_path = out / f'{assignment}_scored.csv'
-            assignment_data.to_csv(scored_path, index=False)
+        # Load gradebooks
+        lecture_dfs = {}
+        for lf in lecture_files:
+            lf_path = Path(lf)
+            if not lf_path.exists():
+                print(f"ERROR: Gradebook not found: {lf}")
+                continue
+            lecture_dfs[lf_path.name] = read_csv_with_trailing_comma_fix(lf_path)
 
-        bblearn = assignment_data[[
-            'Last name', 'First name', 'Primary email',
-            'School email', 'Student ID', 'Percent score',
-        ]]
-        bblearn_path = out / f'{assignment}_bblearn.csv'
-        bblearn.to_csv(bblearn_path, index=False)
-        print(f'BBLearn upload file saved: {bblearn_path}')
+        if lecture_dfs:
+            # Collect all usernames present in any gradebook for orphan detection
+            all_lecture_usernames = set()
+            for lf_df in lecture_dfs.values():
+                un_col = find_username_column(lf_df)
+                em_col = find_email_column(lf_df)
+                for _, row in lf_df.iterrows():
+                    if un_col and not pd.isna(row.get(un_col)):
+                        all_lecture_usernames.add(str(row[un_col]).strip().lower())
+                    elif em_col:
+                        u = extract_username_from_email(row[em_col])
+                        if u:
+                            all_lecture_usernames.add(u)
 
-    if len(all_true_zero_records) > 0:
-        true_zeros_df = pd.DataFrame(all_true_zero_records)
-        true_zeros_path = out / 'all_true_zeros.csv'
-        true_zeros_df.to_csv(true_zeros_path, index=False, encoding='utf-8-sig')
+            print("\n" + "=" * 60)
+            print("GRADEBOOK UPDATE")
+            print("=" * 60)
 
-        print(f"\nConsolidated true zeros report: {true_zeros_path}")
-        print(f"   Total non-submissions: {len(true_zeros_df)}")
+            for assignment_name, merged_df in processed:
+                email_col = find_email_column(merged_df)
+                score_col = next(
+                    (c for c in merged_df.columns if 'percent score' in c.lower()), None
+                )
+                if not email_col or not score_col:
+                    print(f"\n   WARNING: Cannot extract scores for '{assignment_name}' — skipping")
+                    continue
 
-        print(f"\n   Non-submissions by assignment:")
-        for assignment in processed_assignments:
-            count = len(true_zeros_df[true_zeros_df['Assignment'] == assignment])
-            if count > 0:
-                print(f"      {assignment}: {count}")
+                score_map, id_map, name_map = build_student_score_maps(merged_df, score_col)
 
-        if len(true_zeros_df) > 0:
-            non_submission_counts = (
-                true_zeros_df.groupby('Student ID').size().sort_values(ascending=False)
-            )
-            if len(non_submission_counts) > 0:
-                print(f"\n   Students with multiple non-submissions:")
-                for student_id, count in non_submission_counts.head(10).items():
-                    if count > 1:
-                        student_rows = true_zeros_df[
-                            true_zeros_df['Student ID'] == student_id
-                        ]
-                        if len(student_rows) > 0:
-                            name = (
-                                f"{student_rows.iloc[0]['First Name']} "
-                                f"{student_rows.iloc[0]['Last Name']}"
-                            )
-                            print(f"      {name} ({student_id}): {count} assignments")
-    else:
-        print(f"\n   No true zeros (all students submitted or submitted late)")
+                print(f"\n   Assignment: {assignment_name}")
+                for lecture_name, lecture_df in lecture_dfs.items():
+                    try:
+                        _, updated = apply_scores_to_gradebook(
+                            lecture_df, score_map, assignment_name, verbose=verbose,
+                            id_score_map=id_map, name_score_map=name_map,
+                        )
+                        if verbose:
+                            print(f"      {lecture_name}: {updated} updated")
+                    except ValueError as e:
+                        print(f"      ERROR ({lecture_name}): {e}")
 
-    print(f"\nIndividual merged files saved to: {out}/")
+                orphaned = [
+                    {'Username': u, 'Score': score_map[u]}
+                    for u in set(score_map.keys()) - all_lecture_usernames
+                ]
+                if orphaned:
+                    out.mkdir(parents=True, exist_ok=True)
+                    safe_name = assignment_name.replace(' ', '_')
+                    orphaned_path = out / f'{safe_name}_orphaned.csv'
+                    pd.DataFrame(orphaned).to_csv(orphaned_path, index=False, encoding='utf-8-sig')
+                    print(f"      WARNING: {len(orphaned)} orphaned student(s) not found "
+                          f"in any gradebook — see {orphaned_path}")
+
+            out.mkdir(parents=True, exist_ok=True)
+            print("\nWriting updated gradebooks:")
+            for lecture_name, df in lecture_dfs.items():
+                unnamed_cols = [col for col in df.columns if 'Unnamed' in str(col)]
+                if unnamed_cols:
+                    df = df.drop(columns=unnamed_cols)
+                df = sort_assignment_columns(df)
+                lec_id_col = find_student_id_column(df)
+                if lec_id_col:
+                    df[lec_id_col] = df[lec_id_col].apply(normalize_student_id)
+                output_path = out / lecture_name.replace('.csv', '_merged.csv')
+                df.to_csv(output_path, index=False, encoding='utf-8-sig')
+                print(f"   {output_path}")
+
     print("\nDone!")

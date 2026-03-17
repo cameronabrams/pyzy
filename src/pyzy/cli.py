@@ -11,34 +11,44 @@ def build_parser():
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
 
-    # --- score subcommand (batch_merge_deadline_lift) ---
-    score_parser = subparsers.add_parser(
-        'score',
-        help='Merge before/after deadline-lift assignment pairs and apply late penalties',
+    # --- assignment subcommand ---
+    assignment_parser = subparsers.add_parser(
+        'assignment',
+        help='Score assignment CSVs, optionally merging deadline/lifted pairs and applying late penalties',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Example:
-    pyzy score --deadline deadline/ --lifted lifted/
-    pyzy score -d deadline/ -l lifted/ -o merged/ -a adjustments.yaml
+    pyzy assignment -d report.csv                              (single file, no modifications)
+    pyzy assignment -d report.csv -l sec_A.csv sec_B.csv       (single file, update gradebooks)
+    pyzy assignment -d deadline.csv -L lifted.csv -a adj.yaml -l sec_A.csv sec_B.csv
+    pyzy assignment -d deadline/ -L lifted/ -a adj.yaml -l gradebooks/*.csv -o merged/
 """,
     )
-    score_parser.add_argument(
+    assignment_parser.add_argument(
         '--deadline', '-d', required=True,
-        help='Directory containing assignment CSVs with original due dates',
+        metavar='FILE_OR_DIR',
+        help='Assignment CSV with original due dates, or a directory of such CSVs',
     )
-    score_parser.add_argument(
-        '--lifted', '-l', required=True,
-        help='Directory containing assignment CSVs with lifted deadlines',
+    assignment_parser.add_argument(
+        '--lifted', '-L', default=None,
+        metavar='FILE_OR_DIR',
+        help='Assignment CSV with lifted deadlines, or a directory of such CSVs (optional). '
+             'When omitted, scores are taken from --deadline as-is with no modifications. '
+             'Must match the type (file or directory) of --deadline.',
     )
-    score_parser.add_argument(
-        '--output-dir', '-o', default='merged',
-        help='Output directory for merged files (default: merged/)',
+    assignment_parser.add_argument(
+        '--lecture', '-l', nargs='+', default=None,
+        help='Lecture section gradebook CSV files to update with scored grades (optional)',
     )
-    score_parser.add_argument(
+    assignment_parser.add_argument(
+        '--output-dir', '-o', default='.',
+        help='Output directory for output files (default: current directory)',
+    )
+    assignment_parser.add_argument(
         '--adjustments', '-a', default=None,
-        help='YAML file containing score adjustments (optional)',
+        help='YAML file containing score adjustments (optional; ignored without --lifted)',
     )
-    score_parser.add_argument(
+    assignment_parser.add_argument(
         '--quiet', '-q', action='store_true',
         help='Suppress verbose output',
     )
@@ -88,8 +98,19 @@ Example:
         epilog="""\
 Example:
     pyzy activity report.csv -l section_A.csv section_B.csv -n "W1 CA"
+    pyzy activity report.csv -l section_A.csv -n "W1 CA" --select recent --due "2026-03-09T23:59:00Z"
     pyzy activity a1.csv a2.csv -l gradebooks/*.csv -n "W1 CA" "W2 PA"
     pyzy activity a*.csv -l gradebooks/*.csv -n "CA"  (aggregate: best score + submission count)
+
+The -n/--name values are substrings matched against existing gradebook columns.
+Each substring must match exactly one column (error if ambiguous or not found).
+
+Selection (--select): choose which attempt per student counts before any penalty.
+    max     highest raw score (default)
+    recent  most recently submitted
+
+Late penalty (--due): applied to the selected submission.
+    0-24 h late: -20%  |  each additional 24 h: -10%
 """,
     )
     activity_parser.add_argument(
@@ -101,7 +122,19 @@ Example:
     )
     activity_parser.add_argument(
         '--name', '-n', nargs='+', required=True,
-        help='Column name(s): one per input file, or one name to aggregate all into a single column',
+        help='Substring(s) identifying existing gradebook column(s): one per input file, '
+             'or one substring to aggregate all into a single column',
+    )
+    activity_parser.add_argument(
+        '--select', '-s', choices=['max', 'recent'], default='max',
+        help='Which submission per student counts: "max" (highest raw score, default) '
+             'or "recent" (most recently submitted)',
+    )
+    activity_parser.add_argument(
+        '--due', '-D', default=None,
+        metavar='DATETIME',
+        help='Due date/time (ISO 8601, e.g. "2026-03-09T23:59:00Z"). '
+             'Late submissions receive: -20%% for any lateness, then -10%% per additional 24 h.',
     )
     activity_parser.add_argument(
         '--output-dir', '-o', default='.',
@@ -119,11 +152,12 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == 'score':
-        from .score import run_score
-        run_score(
-            deadline_dir=args.deadline,
-            lifted_dir=args.lifted,
+    if args.command == 'assignment':
+        from .assignment import run_assignment
+        run_assignment(
+            deadline_input=args.deadline,
+            lifted_input=args.lifted,
+            lecture_files=args.lecture,
             output_dir=args.output_dir,
             adjustments_file=args.adjustments,
             quiet=args.quiet,
@@ -146,6 +180,8 @@ def main(argv=None):
             column_names=args.name,
             output_dir=args.output_dir,
             quiet=args.quiet,
+            due_date=args.due,
+            select=args.select,
         )
 
 

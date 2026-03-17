@@ -15,6 +15,7 @@ from .common import (
     normalize_student_id,
     parse_assignment_filename,
     read_csv_with_trailing_comma_fix,
+    resolve_column,
 )
 
 
@@ -76,7 +77,6 @@ def merge_grades_from_assignments(lecture_files, assignment_files, verbose=True)
         'stats': {},
         'matched_students': set(),
         'students_not_found': set(),
-        'new_columns': [],
         'match_methods': {'by_id': 0, 'by_email': 0},
         'orphaned_rows': pd.DataFrame(),
         'failed_id_match_rows': pd.DataFrame(),
@@ -187,12 +187,13 @@ def merge_grades_from_assignments(lecture_files, assignment_files, verbose=True)
                 if username:
                     username_map[username] = idx
 
-            if abbrev_name not in lecture_df.columns:
-                lecture_df[abbrev_name] = float('nan')
-                if abbrev_name not in results['new_columns']:
-                    results['new_columns'].append(abbrev_name)
-                if verbose:
-                    print(f"      Created new column: '{abbrev_name}'")
+            try:
+                target_col = resolve_column(lecture_df, abbrev_name)
+            except ValueError as e:
+                print(f"      ERROR: {e}")
+                continue
+            if verbose and target_col != abbrev_name:
+                print(f"      Resolved '{abbrev_name}' -> '{target_col}'")
 
             grades_updated = 0
             matched_by_id = 0
@@ -249,7 +250,7 @@ def merge_grades_from_assignments(lecture_files, assignment_files, verbose=True)
 
                 final_grade = base_grade
 
-                lecture_df.at[lecture_row_idx, abbrev_name] = final_grade
+                lecture_df.at[lecture_row_idx, target_col] = final_grade
                 grades_updated += 1
 
             lecture_dfs[lecture_name] = lecture_df
@@ -368,15 +369,16 @@ def run_merge(lecture_files, assignment_files, assignment_dir=None,
     print(f"   Matched by Student ID: {results['match_methods']['by_id']}")
     print(f"   Matched by Email: {results['match_methods']['by_email']}")
 
-    if results['new_columns']:
-        print(f"\nNew columns created: {', '.join(results['new_columns'])}")
-
     # Write output files
     print("\nWriting output files:")
     for lecture_name, df in results['updated_dataframes'].items():
         unnamed_cols = [col for col in df.columns if 'Unnamed' in str(col)]
         if unnamed_cols:
             df = df.drop(columns=unnamed_cols)
+
+        lec_id_col = find_student_id_column(df)
+        if lec_id_col:
+            df[lec_id_col] = df[lec_id_col].apply(normalize_student_id)
 
         output_name = lecture_name.replace('.csv', '_merged.csv')
         output_path = out / output_name
