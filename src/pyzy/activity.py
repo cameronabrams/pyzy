@@ -7,6 +7,7 @@ Expected CSV columns:
     Date of submission, Score, Max score, Autograded test results
 """
 
+import csv
 import math
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ from .common import (
     find_email_column,
     find_name_columns,
     find_student_id_column,
+    fmt_late,
+    middle_name_matched as _middle_name_matched,
     normalize_student_id,
     read_csv_with_trailing_comma_fix,
     resolve_column,
@@ -65,18 +68,6 @@ def _late_penalty_factor(submission_dt, due_dt):
     return max(0.0, 1.0 - penalty)
 
 
-def _fmt_late(delta_seconds):
-    """Format a positive number of seconds as e.g. '2d 3h 15m'."""
-    total_minutes = int(delta_seconds // 60)
-    days, remainder = divmod(total_minutes, 1440)
-    hours, minutes = divmod(remainder, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
 
 
 def _print_late_report(late_df, due_dt):
@@ -90,7 +81,7 @@ def _print_late_report(late_df, due_dt):
             'Name': f"{row['Last name']}, {row['First name']}",
             'Email': row['Email'],
             'Submitted (UTC)': row['_SubDt'].strftime('%Y-%m-%d %H:%M'),
-            'Late by': _fmt_late(delta_s),
+            'Late by': fmt_late(delta_s),
             'Penalty': f"-{penalty_pct}%",
             'Score': f"{row['Score']}/{int(row['Max score'])}",
             'After penalty': f"{penalized_pct}%",
@@ -192,7 +183,7 @@ def parse_activity_report(filepath, verbose=True, due_date=None, select='max'):
 
 
 def apply_scores_to_gradebook(df, score_map, column_pattern, verbose=True,
-                               id_score_map=None, name_score_map=None):
+                               id_score_map=None, name_score_map=None, force=False):
     """
     Write scores from student lookup maps into a single gradebook DataFrame.
 
@@ -218,6 +209,7 @@ def apply_scores_to_gradebook(df, score_map, column_pattern, verbose=True,
     column_name = resolve_column(df, column_pattern)
     if verbose and column_pattern != column_name:
         print(f"      Resolved '{column_pattern}' -> '{column_name}'")
+    df[column_name] = df[column_name].astype(object)
 
     lec_email_col = find_email_column(df)
     lec_username_col = find_username_column(df)
@@ -255,8 +247,14 @@ def apply_scores_to_gradebook(df, score_map, column_pattern, verbose=True,
                 name_matched += 1
 
         if score is not None:
-            df.at[idx, column_name] = score
-            updated += 1
+            existing = df.at[idx, column_name]
+            try:
+                existing_val = float(existing)
+            except (ValueError, TypeError):
+                existing_val = None
+            if force or existing_val is None or score > existing_val:
+                df.at[idx, column_name] = f"{score:.2f}"
+                updated += 1
 
     if verbose and name_matched > 0:
         print(f"      Name-matched: {name_matched} student(s) — verify these")
@@ -265,7 +263,7 @@ def apply_scores_to_gradebook(df, score_map, column_pattern, verbose=True,
 
 
 def run_activity(input_files, lecture_files, column_names, output_dir='.', quiet=False,
-                 due_date=None, select='max'):
+                 due_date=None, select='max', force=False):
     """
     Run the activity report workflow for one or more reports.
 
@@ -314,19 +312,25 @@ def run_activity(input_files, lecture_files, column_names, output_dir='.', quiet
     print("=" * 60)
 
     if aggregate:
-        _run_aggregated(input_files, lecture_files, column_names[0], out, verbose, due_date, select)
+        _run_aggregated(input_files, lecture_files, column_names[0], out, verbose, due_date, select, force=force)
     else:
-        _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date, select)
+        _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date, select, force=force)
 
     print("\nDone!")
 
 
 def _gradebook_usernames(gradebook_dfs):
-    """Return the set of all usernames present in any of the loaded gradebook DataFrames."""
+    """
+    Return the set of all usernames present in any of the loaded gradebook
+    DataFrames, plus synthesised first.last keys derived from name columns
+    (used to suppress false-positive orphan reports for first.middle.last
+    zyBooks usernames whose shortened form matches a known student by name).
+    """
     usernames = set()
     for df in gradebook_dfs.values():
         un_col = find_username_column(df)
         em_col = find_email_column(df)
+        first_col, last_col = find_name_columns(df)
         for _, row in df.iterrows():
             if un_col and not pd.isna(row.get(un_col)):
                 usernames.add(str(row[un_col]).strip().lower())
@@ -334,6 +338,11 @@ def _gradebook_usernames(gradebook_dfs):
                 u = extract_username_from_email(row[em_col])
                 if u:
                     usernames.add(u)
+            if first_col and last_col:
+                first = str(row[first_col]).strip().lower() if pd.notna(row[first_col]) else ''
+                last = str(row[last_col]).strip().lower() if pd.notna(row[last_col]) else ''
+                if first and last:
+                    usernames.add(f"{first}.{last}")
     return usernames
 
 
@@ -342,6 +351,7 @@ def _write_orphan_report(score_map, all_lecture_usernames, label, out):
     orphaned = [
         {'Username': u, 'Score': score_map[u]}
         for u in sorted(set(score_map.keys()) - all_lecture_usernames)
+        if not _middle_name_matched(u, all_lecture_usernames)
     ]
     if orphaned:
         safe_label = label.replace(' ', '_')
@@ -351,7 +361,7 @@ def _write_orphan_report(score_map, all_lecture_usernames, label, out):
               f"in any gradebook — see {orphaned_path}")
 
 
-def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_date=None, select='max'):
+def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_date=None, select='max', force=False):
     """Aggregate multiple reports into a single column, keeping max score per student."""
     n_activities = len(input_files)
 
@@ -406,7 +416,7 @@ def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_d
 
         resolved_name, updated = apply_scores_to_gradebook(
             df, score_map, column_name, verbose=verbose,
-            name_score_map=name_score_map,
+            name_score_map=name_score_map, force=force,
         )
         count_col = "Number Submitted"
 
@@ -433,13 +443,13 @@ def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_d
 
         output_name = lecture_name.replace('.csv', '_merged.csv')
         output_path = out / output_name
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        df.to_csv(output_path, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
         print(f"   {output_path}")
 
     _write_orphan_report(score_map, all_lecture_usernames, column_name, out)
 
 
-def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date=None, select='max'):
+def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date=None, select='max', force=False):
     """Each report gets its own column in the gradebook."""
     gradebooks = {}
     for filepath in lecture_files:
@@ -461,7 +471,7 @@ def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_
                 print(f"\n   -> {lecture_name} ({len(df)} students)")
             _, updated = apply_scores_to_gradebook(
                 df, score_map, column_name, verbose=verbose,
-                id_score_map=id_map, name_score_map=name_map,
+                id_score_map=id_map, name_score_map=name_map, force=force,
             )
             if verbose:
                 print(f"      Updated: {updated}")
@@ -477,5 +487,5 @@ def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_
 
         output_name = lecture_name.replace('.csv', '_merged.csv')
         output_path = out / output_name
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        df.to_csv(output_path, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
         print(f"   {output_path}")

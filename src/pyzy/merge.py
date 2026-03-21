@@ -3,6 +3,7 @@ Grade Merger - transfers grades from per-assignment CSVs to lecture section CSVs
 based on student ID matching.
 """
 
+import csv
 import re
 from pathlib import Path
 
@@ -382,7 +383,7 @@ def run_merge(lecture_files, assignment_files, assignment_dir=None,
 
         output_name = lecture_name.replace('.csv', '_merged.csv')
         output_path = out / output_name
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        df.to_csv(output_path, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
         print(f"   {output_path}")
         stats = results['stats'].get(lecture_name, {})
         print(f"      Grades updated: {stats.get('grades_updated', 0)}")

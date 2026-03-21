@@ -150,6 +150,15 @@ def build_student_score_maps(student_df, score_col):
             username = extract_username_from_email(row[email_col])
             if username:
                 username_map[username] = score
+                # first.middle.last -> also register first.last and (last, first)
+                parts = username.split('.')
+                if len(parts) >= 3:
+                    short = f"{parts[0]}.{parts[-1]}"
+                    if short not in username_map:
+                        username_map[short] = score
+                    key = (parts[-1].lower(), parts[0].lower())
+                    if key not in name_map:
+                        name_map[key] = score
 
         if id_col:
             student_id = normalize_student_id(row[id_col])
@@ -163,6 +172,32 @@ def build_student_score_maps(student_df, score_col):
                 name_map[(last, first)] = score
 
     return username_map, id_map, name_map
+
+
+def middle_name_matched(username, known_usernames):
+    """
+    Return True if *username* is a 3-part first.middle.last username whose
+    shortened first.last form appears in *known_usernames*, indicating the
+    student was matched under the shorter form.
+    """
+    parts = username.split('.')
+    if len(parts) < 3:
+        return False
+    return f"{parts[0]}.{parts[-1]}" in known_usernames
+
+
+def fmt_late(delta_seconds):
+    """Format a positive number of seconds as e.g. '2d 3h 15m'."""
+    total_minutes = int(delta_seconds // 60)
+    days, remainder = divmod(total_minutes, 1440)
+    hours, minutes = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
 
 
 def resolve_column(df, pattern):
