@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def build_parser():
@@ -43,6 +44,12 @@ Example:
              'Naive datetimes are treated as America/New_York.',
     )
     assignment_parser.add_argument(
+        '--weights-csv', default=None,
+        metavar='FILE',
+        help='CSV of per-assignment weights for WAVG computation: same structure as '
+             '--due-dates-csv but values are fractional weights.',
+    )
+    assignment_parser.add_argument(
         '--days-grace', type=int, default=0,
         metavar='N',
         help='Days after due date before late penalty applies (default: 0)',
@@ -77,8 +84,42 @@ Example:
         help='Original (unmodified) BBLearn gradebook CSVs used with --revert',
     )
     assignment_parser.add_argument(
+        '--no-penalty', nargs='+', default=None,
+        metavar='STUDENT_ID',
+        help='Student ID(s) exempt from late penalties (score kept as-is regardless of lateness)',
+    )
+    assignment_parser.add_argument(
+        '--grace-limit', type=float, default=None,
+        metavar='DAYS',
+        help='Zero out scores for submissions more than this many days late (default: no limit)',
+    )
+    assignment_parser.add_argument(
+        '--best-one-of', action='store_true',
+        help='Replace Percent score with the best single component column percentage '
+             '(component columns match <int>.<int>, e.g. "19.1 - Lab (10)")',
+    )
+    assignment_parser.add_argument(
+        '--due', default=None,
+        metavar='DATETIME',
+        help='Fallback due date/time used when --due-dates-csv has no entry for the assignment '
+             '(or as the sole due date when --due-dates-csv is not provided). '
+             'Naive datetimes are treated as America/New_York.',
+    )
+    assignment_parser.add_argument(
+        '--name', '-n', default=None,
+        metavar='NAME',
+        help='Override the derived assignment name used as the gradebook column target '
+             '(e.g. "W3 PA"). Only applies when processing a single file.',
+    )
+    assignment_parser.add_argument(
         '--quiet', '-q', action='store_true',
         help='Suppress verbose output',
+    )
+    assignment_parser.add_argument(
+        '--audit-log', default='pyzy_audit',
+        metavar='DIR',
+        help='Directory for per-assignment audit JSON files (default: pyzy_audit/). '
+             'Pass an empty string to disable logging.',
     )
 
     # --- merge subcommand (merge_grades_v2) ---
@@ -117,6 +158,11 @@ Example:
         '--quiet', '-q', action='store_true',
         help='Suppress verbose output',
     )
+    merge_parser.add_argument(
+        '--weights-csv', default=None,
+        metavar='FILE',
+        help='CSV of per-assignment weights for WAVG computation.',
+    )
 
     # --- activity subcommand ---
     activity_parser = subparsers.add_parser(
@@ -133,11 +179,13 @@ Example:
 The -n/--name values are substrings matched against existing gradebook columns.
 Each substring must match exactly one column (error if ambiguous or not found).
 
-Selection (--select): choose which attempt per student counts before any penalty.
-    max     highest raw score (default)
-    recent  most recently submitted
+Selection (--select): choose which attempt per student counts.
+    max      highest raw score overall, then late penalty applied (default)
+    recent   most recently submitted, then late penalty applied
+    pre-due  best score among submissions on or before --due; no penalty;
+             students with no on-time submission receive 0
 
-Late penalty (--due): applied to the selected submission.
+Late penalty (--due): applied to the selected submission (max/recent only).
     0-24 h late: -20%  |  each additional 24 h: -10%
 """,
     )
@@ -154,9 +202,12 @@ Late penalty (--due): applied to the selected submission.
              'or one substring to aggregate all into a single column',
     )
     activity_parser.add_argument(
-        '--select', '-s', choices=['max', 'recent'], default='max',
-        help='Which submission per student counts: "max" (highest raw score, default) '
-             'or "recent" (most recently submitted)',
+        '--select', '-s', choices=['max', 'recent', 'pre-due'], default='max',
+        help='Which submission per student counts: '
+             '"max" (highest raw score, then penalty applied, default); '
+             '"recent" (most recently submitted, then penalty applied); '
+             '"pre-due" (best score among on-time submissions only — requires --due; '
+             'students with no on-time submission receive 0)',
     )
     activity_parser.add_argument(
         '--due', '-D', default=None,
@@ -175,6 +226,42 @@ Late penalty (--due): applied to the selected submission.
     activity_parser.add_argument(
         '--force', action='store_true',
         help='Overwrite gradebook scores even if the new score is lower than the existing one',
+    )
+    activity_parser.add_argument(
+        '--days-grace', type=int, default=0,
+        metavar='N',
+        help='Days after due date before late penalty applies (default: 0)',
+    )
+    activity_parser.add_argument(
+        '--hours-grace', type=int, default=0,
+        metavar='N',
+        help='Additional hours after due date before late penalty applies (default: 0)',
+    )
+    activity_parser.add_argument(
+        '--grace-limit', type=float, default=None,
+        metavar='DAYS',
+        help='Zero out scores for submissions more than this many days late (default: no limit)',
+    )
+    activity_parser.add_argument(
+        '--penalty', type=float, default=0.2,
+        metavar='FRAC',
+        help='Flat fraction deducted for any late submission beyond grace period (default: 0.2)',
+    )
+    activity_parser.add_argument(
+        '--weights-csv', default=None,
+        metavar='FILE',
+        help='CSV of per-assignment weights for WAVG computation.',
+    )
+    activity_parser.add_argument(
+        '--no-penalty', nargs='+', default=None,
+        metavar='STUDENT_ID',
+        help='Student ID(s) exempt from late penalties (looked up via gradebook)',
+    )
+    activity_parser.add_argument(
+        '--audit-log', default='pyzy_audit',
+        metavar='DIR',
+        help='Directory for per-assignment audit JSON files (default: pyzy_audit/). '
+             'Pass an empty string to disable logging.',
     )
 
     # --- late-adjust subcommand ---
@@ -212,6 +299,80 @@ For each student in each late report you will be prompted:
         '--output-dir', '-o', default='.',
         help='Output directory for updated gradebooks (default: current directory)',
     )
+    la_parser.add_argument(
+        '--weights-csv', default=None,
+        metavar='FILE',
+        help='CSV of per-assignment weights for WAVG computation.',
+    )
+    la_parser.add_argument(
+        '--student', default=None,
+        metavar='QUERY',
+        help='Filter to one student: accepts student ID, username, or "Last, First" name',
+    )
+
+    # --- late-report subcommand ---
+    lr_parser = subparsers.add_parser(
+        'late-report',
+        help='Pivot multiple *_late.csv files into a single per-student lateness summary',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Example:
+    pyzy late-report --late out/W3_PA_late.csv out/W5_IL_late.csv -o late_summary.csv
+    pyzy late-report --late-dir out/ -o late_summary.csv
+""",
+    )
+    lr_parser.add_argument(
+        '--late', '-r', nargs='+', default=None,
+        metavar='FILE',
+        help='Late report CSV file(s) produced by the assignment subcommand',
+    )
+    lr_parser.add_argument(
+        '--late-dir', default=None,
+        metavar='DIR',
+        help='Directory containing *_late.csv files (alternative to --late)',
+    )
+    lr_parser.add_argument(
+        '--output', '-o', default='late_summary.csv',
+        metavar='FILE',
+        help='Output CSV path (default: late_summary.csv)',
+    )
+
+    # --- query subcommand ---
+    query_parser = subparsers.add_parser(
+        'query',
+        help='Look up a student\'s grades across one or more gradebooks',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Example:
+    pyzy query -l lecA.csv lecB.csv --id 14788528
+    pyzy query -l lecA.csv lecB.csv --last Smith --first John
+    pyzy query -l lecA.csv lecB.csv --id 14788528 --column "W3 PA"
+""",
+    )
+    query_parser.add_argument(
+        '--lecture', '-l', nargs='+', required=True,
+        help='BBLearn gradebook CSV files to search',
+    )
+    query_parser.add_argument(
+        '--id', dest='student_id', default=None,
+        metavar='STUDENT_ID',
+        help='Student ID to look up',
+    )
+    query_parser.add_argument(
+        '--last', default=None,
+        metavar='NAME',
+        help='Last name (use with --first)',
+    )
+    query_parser.add_argument(
+        '--first', default=None,
+        metavar='NAME',
+        help='First name (use with --last)',
+    )
+    query_parser.add_argument(
+        '--column', '-c', default=None,
+        metavar='PATTERN',
+        help='Substring to filter grade columns (shows all if omitted)',
+    )
 
     # --- assign-lab-section subcommand ---
     als_parser = subparsers.add_parser(
@@ -237,12 +398,57 @@ Example:
         help='Suppress verbose output',
     )
 
+    # --- log subcommand ---
+    log_parser = subparsers.add_parser(
+        'log',
+        help='Query the audit log for a student\'s grade history',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Example:
+    pyzy log --id 14788528
+    pyzy log --username john.smith
+    pyzy log --last Smith --first John
+    pyzy log --id 14788528 --audit-log /path/to/pyzy_audit/
+""",
+    )
+    log_parser.add_argument(
+        '--audit-log', default='pyzy_audit',
+        metavar='DIR',
+        help='Directory containing per-assignment audit JSON files (default: pyzy_audit/)',
+    )
+    log_parser.add_argument(
+        '--id', dest='student_id', default=None,
+        metavar='STUDENT_ID',
+        help='Student ID to look up',
+    )
+    log_parser.add_argument(
+        '--username', '-u', default=None,
+        metavar='USERNAME',
+        help='Username (email prefix) to look up',
+    )
+    log_parser.add_argument(
+        '--last', default=None,
+        metavar='NAME',
+        help='Last name to look up',
+    )
+    log_parser.add_argument(
+        '--first', default=None,
+        metavar='NAME',
+        help='First name (use with --last)',
+    )
+
     return parser
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    def _make_audit_log(path_str):
+        if not path_str:
+            return None
+        from .audit import AuditLog
+        return AuditLog(path_str)
 
     if args.command == 'assignment':
         if args.revert:
@@ -255,6 +461,7 @@ def main(argv=None):
                 lecture_files=args.lecture,
                 original_files=args.original,
                 quiet=args.quiet,
+                weights_csv=args.weights_csv,
             )
         elif not args.deadline:
             print("ERROR: --deadline is required (or use --revert for undo mode)")
@@ -272,6 +479,13 @@ def main(argv=None):
                 penalty=args.penalty,
                 date_audit=args.date_audit,
                 force=args.force,
+                best_one_of=args.best_one_of,
+                due=args.due,
+                name=args.name,
+                grace_limit=args.grace_limit,
+                no_penalty_ids=args.no_penalty,
+                weights_csv=args.weights_csv,
+                audit_log=_make_audit_log(args.audit_log),
             )
     elif args.command == 'merge':
         from .merge import run_merge
@@ -282,6 +496,7 @@ def main(argv=None):
             assignment_pattern=args.assignment_pattern,
             output_dir=args.output_dir,
             quiet=args.quiet,
+            weights_csv=args.weights_csv,
         )
     elif args.command == 'activity':
         from .activity import run_activity
@@ -294,6 +509,13 @@ def main(argv=None):
             due_date=args.due,
             select=args.select,
             force=args.force,
+            days_grace=args.days_grace,
+            hours_grace=args.hours_grace,
+            grace_limit=args.grace_limit,
+            penalty=args.penalty,
+            weights_csv=args.weights_csv,
+            no_penalty_ids=args.no_penalty,
+            audit_log=_make_audit_log(args.audit_log),
         )
     elif args.command == 'late-adjust':
         late_files = args.late or []
@@ -311,6 +533,24 @@ def main(argv=None):
             late_files=late_files,
             lecture_files=args.lecture,
             output_dir=args.output_dir,
+            weights_csv=args.weights_csv,
+            student=args.student,
+        )
+    elif args.command == 'late-report':
+        from .late_report import run_late_report
+        run_late_report(
+            late_files=args.late,
+            late_dir=args.late_dir,
+            output_path=args.output,
+        )
+    elif args.command == 'query':
+        from .query import run_query
+        run_query(
+            lecture_files=args.lecture,
+            student_id=args.student_id,
+            last=args.last,
+            first=args.first,
+            column_pattern=args.column,
         )
     elif args.command == 'assign-lab-section':
         from .labsection import run_assign_lab_section
@@ -318,6 +558,18 @@ def main(argv=None):
             lecture_files=args.lecture,
             lab_files=args.lab,
             quiet=args.quiet,
+        )
+    elif args.command == 'log':
+        if not any([args.student_id, args.username, args.last]):
+            print("ERROR: Provide at least one of --id, --username, or --last")
+            sys.exit(1)
+        from .log_cmd import run_log
+        run_log(
+            audit_dir=args.audit_log,
+            student_id=args.student_id,
+            username=args.username,
+            last=args.last,
+            first=args.first,
         )
 
 

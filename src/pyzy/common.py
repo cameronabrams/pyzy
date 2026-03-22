@@ -228,6 +228,112 @@ def resolve_column(df, pattern):
     return matches[0]
 
 
+def load_weights_csv(path):
+    """
+    Load per-assignment weights from a CSV structured like the due dates CSV.
+
+    Expected format:
+        Week column (any name containing 'week', or the first column)
+        Type columns: PA, CA, OL, IL (one per assignment type)
+
+    Returns:
+        dict mapping (week_int, type_str) -> float weight
+    """
+    df = pd.read_csv(path)
+    week_col = next((c for c in df.columns if 'week' in c.lower()), df.columns[0])
+    result = {}
+    for _, row in df.iterrows():
+        m = re.search(r'\d+', str(row[week_col]))
+        if not m:
+            continue
+        week_num = int(m.group())
+        for col in df.columns:
+            if col == week_col:
+                continue
+            val = row[col]
+            if pd.isna(val) or str(val).strip() == '':
+                continue
+            try:
+                result[(week_num, col.strip())] = float(val)
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
+def recompute_averages(df, weights=None):
+    """
+    Recompute XX AVG columns (and XX WAVG if weights provided) in-place.
+
+    For AVG: plain mean of all non-empty W* XX score columns per student.
+    For WAVG: weighted mean using weights dict {(week_int, type_str): float}.
+      Assignments with no entry in weights are skipped.
+
+    Types or target columns not present in the gradebook are silently skipped.
+    Returns the (possibly modified) DataFrame.
+    """
+    TYPES = ['PA', 'CA', 'IL', 'OL']
+
+    for atype in TYPES:
+        # Collect W* TYPE columns and their week numbers
+        week_cols = []
+        for col in df.columns:
+            m = re.match(rf'^W(\d+)\s+{atype}\b', col.strip(), re.IGNORECASE)
+            if m:
+                week_cols.append((col, int(m.group(1))))
+        if not week_cols:
+            continue
+
+        col_names = [c for c, _ in week_cols]
+
+        # --- AVG ---
+        avg_matches = [
+            col for col in df.columns
+            if re.match(rf'^{atype}\s+AVG\b', col.strip(), re.IGNORECASE)
+        ]
+        if len(avg_matches) == 1:
+            avg_col = avg_matches[0]
+            df[avg_col] = df[avg_col].astype(object)
+            for idx, row in df.iterrows():
+                scores = []
+                for col in col_names:
+                    val = row[col]
+                    if pd.isna(val) or str(val).strip() == '':
+                        continue
+                    try:
+                        scores.append(float(val))
+                    except (ValueError, TypeError):
+                        pass
+                df.at[idx, avg_col] = f"{sum(scores) / len(scores):.2f}" if scores else ''
+
+        # --- WAVG ---
+        if weights:
+            wavg_matches = [
+                col for col in df.columns
+                if re.match(rf'^{atype}\s+WAVG\b', col.strip(), re.IGNORECASE)
+            ]
+            if len(wavg_matches) == 1:
+                wavg_col = wavg_matches[0]
+                df[wavg_col] = df[wavg_col].astype(object)
+                for idx, row in df.iterrows():
+                    wsum = 0.0
+                    wtotal = 0.0
+                    for col, week_num in week_cols:
+                        w = weights.get((week_num, atype))
+                        if w is None:
+                            continue
+                        val = row[col]
+                        if pd.isna(val) or str(val).strip() == '':
+                            continue
+                        try:
+                            wsum += w * float(val)
+                            wtotal += w
+                        except (ValueError, TypeError):
+                            pass
+                    df.at[idx, wavg_col] = f"{wsum / wtotal:.5f}" if wtotal > 0 else ''
+
+    return df
+
+
 def parse_assignment_filename(filename):
     """
     Parse assignment name from zyBooks filename.

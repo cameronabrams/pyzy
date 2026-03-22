@@ -13,8 +13,10 @@ from .common import (
     extract_username_from_email,
     find_email_column,
     find_student_id_column,
+    load_weights_csv,
     normalize_student_id,
     read_csv_with_trailing_comma_fix,
+    recompute_averages,
     resolve_column,
 )
 from .merge import find_username_column, sort_assignment_columns
@@ -54,7 +56,30 @@ def _find_student_row(lecture_df, student_id, email):
     return None
 
 
-def run_late_adjust(late_files, lecture_files, output_dir='.'):
+def _matches_student(row, query):
+    """Return True if the row matches the query (ID, username, or 'Last, First')."""
+    q = query.strip().lower()
+    sid = normalize_student_id(row.get('Student ID', ''))
+    if sid and sid == normalize_student_id(query):
+        return True
+    email = str(row.get('School Email', '')).strip().lower()
+    username = extract_username_from_email(email) if email else ''
+    if username and username == q:
+        return True
+    last = str(row.get('Last Name', '')).strip().lower()
+    first = str(row.get('First Name', '')).strip().lower()
+    # "Last, First" or just "Last"
+    if ',' in q:
+        parts = [p.strip() for p in q.split(',', 1)]
+        if parts[0] == last and (not parts[1] or parts[1] == first):
+            return True
+    else:
+        if q == last:
+            return True
+    return False
+
+
+def run_late_adjust(late_files, lecture_files, output_dir='.', weights_csv=None, student=None):
     """
     Interactively review late submission penalties and optionally override scores.
 
@@ -88,8 +113,10 @@ def run_late_adjust(late_files, lecture_files, output_dir='.'):
         assignment_name = _assignment_name_from_late_file(lp.name)
         late_df = pd.read_csv(lp, encoding='utf-8-sig')
 
+        if student:
+            late_df = late_df[late_df.apply(_matches_student, axis=1, query=student)]
+
         if late_df.empty:
-            print(f"\nSkipping {lp.name} — no rows.")
             continue
 
         print(f"\n{'='*60}")
@@ -107,6 +134,7 @@ def run_late_adjust(late_files, lecture_files, output_dir='.'):
             last          = str(row.get('Last Name', '')).strip()
             first         = str(row.get('First Name', '')).strip()
             student_id    = normalize_student_id(row.get('Student ID', ''))
+            lab_section   = str(row.get('Lab Section', '')).strip()
             email         = str(row.get('School Email', '')).strip()
             score_date    = str(row.get('Score Date', '')).strip()
             how_late      = str(row.get('How Late', '')).strip()
@@ -131,7 +159,8 @@ def run_late_adjust(late_files, lecture_files, output_dir='.'):
             if len(adj_checkpoint) <= i:
                 adj_checkpoint.append(len(adjustments))
 
-            print(f"\n  [{i+1}/{len(rows)}]  {last}, {first}  |  {student_id}  |  {email}")
+            section_str = f"  |  Lab {lab_section}" if lab_section else ""
+            print(f"\n  [{i+1}/{len(rows)}]  {last}, {first}  |  {student_id}{section_str}  |  {email}")
             print(f"  Submitted: {score_date}  |  Late: {how_late}")
             if original_val is not None and applied_val is not None:
                 print(f"  Original: {original_val:.2f}  |  "
@@ -226,6 +255,7 @@ def run_late_adjust(late_files, lecture_files, output_dir='.'):
         id_col = find_student_id_column(df)
         if id_col:
             df[id_col] = df[id_col].apply(normalize_student_id)
+        recompute_averages(df, weights=load_weights_csv(weights_csv) if weights_csv else None)
         output_path = out / lecture_paths[lec_name].name
         df.to_csv(output_path, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
         print(f"   {output_path}")

@@ -13,9 +13,11 @@ from .common import (
     find_email_column,
     find_student_id_column,
     extract_username_from_email,
+    load_weights_csv,
     normalize_student_id,
     parse_assignment_filename,
     read_csv_with_trailing_comma_fix,
+    recompute_averages,
     resolve_column,
 )
 
@@ -307,7 +309,7 @@ def merge_grades_from_assignments(lecture_files, assignment_files, verbose=True)
 
 
 def run_merge(lecture_files, assignment_files, assignment_dir=None,
-              assignment_pattern='*_bblearn.csv', output_dir='.', quiet=False):
+              assignment_pattern='*_bblearn.csv', output_dir='.', quiet=False, weights_csv=None):
     """
     Run the merge workflow.
 
@@ -381,6 +383,7 @@ def run_merge(lecture_files, assignment_files, assignment_dir=None,
         if lec_id_col:
             df[lec_id_col] = df[lec_id_col].apply(normalize_student_id)
 
+        recompute_averages(df, weights=load_weights_csv(weights_csv) if weights_csv else None)
         output_name = lecture_name.replace('.csv', '_merged.csv')
         output_path = out / output_name
         df.to_csv(output_path, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
