@@ -17,6 +17,7 @@ from .common import (
     find_email_column,
     find_student_id_column,
     fmt_late,
+    load_aliases_csv,
     load_weights_csv,
     middle_name_matched as _middle_name_matched,
     normalize_student_id,
@@ -146,6 +147,41 @@ def _late_penalty_factor(delta_seconds, days_grace, penalty, hours_grace=0, grac
     return max(0.0, 1.0 - penalty)
 
 
+def _load_deadlined_scores(filepath):
+    """
+    Read a deadlined zyBooks assignment report and return per-student score lookups.
+
+    Returns (id_scores, username_scores) — both {key: percent_score} dicts.
+    Students with no score (blank Percent score) are excluded.
+    """
+    df = read_csv_with_trailing_comma_fix(filepath)
+    score_col = next((c for c in df.columns if 'percent score' in c.lower()), None)
+    if not score_col:
+        raise ValueError(f"No 'Percent score' column found in {filepath}")
+    id_col = find_student_id_column(df)
+    email_col = find_email_column(df)
+
+    id_scores = {}
+    username_scores = {}
+    for _, row in df.iterrows():
+        val = row.get(score_col)
+        if pd.isna(val) or str(val).strip() == '':
+            continue
+        try:
+            score = float(val)
+        except (TypeError, ValueError):
+            continue
+        if id_col:
+            sid = normalize_student_id(row[id_col])
+            if sid:
+                id_scores[sid] = max(id_scores.get(sid, 0.0), score)
+        if email_col:
+            username = extract_username_from_email(row[email_col])
+            if username:
+                username_scores[username] = max(username_scores.get(username, 0.0), score)
+    return id_scores, username_scores
+
+
 def _build_lab_section_map(lecture_dfs):
     """
     Build student → lab section lookup maps from loaded lecture gradebooks.
@@ -192,7 +228,8 @@ def _build_lab_section_map(lecture_dfs):
 
 def _apply_late_penalties(df, due_dt, days_grace, penalty, assignment_name, verbose=True,
                           lab_section_map=None, id_section_map=None, section_due_dates=None,
-                          date_audit=False, hours_grace=0, grace_limit=None, no_penalty_ids=None):
+                          date_audit=False, hours_grace=0, grace_limit=None, no_penalty_ids=None,
+                          deadlined_scores=None):
     """
     Apply late penalties in-place using the 'Score date' column.
 
@@ -357,17 +394,50 @@ def _apply_late_penalties(df, due_dt, days_grace, penalty, assignment_name, verb
         due_dt_local = effective_due_dt.tz_convert(_LOCAL_TZ)
         delta = (sub_dt - effective_due_dt).total_seconds()
         original_score = row[score_col]
+        penalized_score = original_score  # default; overwritten if penalty applied
 
         exempt = no_penalty_ids and student_sid and student_sid in no_penalty_ids
 
-        if delta > 0:
+        # Determine lateness and final score
+        if deadlined_scores is not None:
+            # Two-report mode: final = max(deadlined_score, lifted_score × (1−penalty))
+            id_sc, un_sc = deadlined_scores
+            dl_score = id_sc.get(student_sid) if student_sid else None
+            if dl_score is None and email_col:
+                dl_score = un_sc.get(extract_username_from_email(row[email_col]))
+            dl_val = float(dl_score) if dl_score is not None else 0.0
+            try:
+                lifted_val = float(original_score)
+            except (TypeError, ValueError):
+                lifted_val = None
+
+            if lifted_val is not None and not pd.isna(original_score):
+                factor_two = max(0.0, 1.0 - penalty) if not exempt else 1.0
+                penalized_val = lifted_val * factor_two
+                final_val = max(dl_val, penalized_val)
+                is_late = penalized_val > dl_val + 0.01
+            else:
+                is_late = False
+                final_val = dl_val
+                factor_two = 1.0
+                penalized_val = dl_val
+        else:
+            is_late = delta > 0
+
+        if is_late:
             n_late += 1
-            if exempt:
+            if deadlined_scores is not None:
+                factor = factor_two
+                penalized_score = final_val  # = penalized_val (since penalized > dl)
+                df.at[idx, score_col] = final_val
+                n_penalized += 1
+                status = 'exempt' if exempt else 'late'
+            elif exempt:
                 factor = 1.0
                 penalized_score = original_score
                 status = 'exempt'
             elif not pd.isna(original_score):
-                factor = _late_penalty_factor(delta, days_grace, penalty, hours_grace, grace_limit)
+                factor = _late_penalty_factor(delta, days_grace, penalty, hours_grace)
                 penalized_score = original_score * factor
                 df.at[idx, score_col] = penalized_score
                 if factor < 1.0:
@@ -380,6 +450,7 @@ def _apply_late_penalties(df, due_dt, days_grace, penalty, assignment_name, verb
                 within_grace = delta <= days_grace * 86400 + hours_grace * 3600
                 status = 'grace' if within_grace else 'late'
 
+            how_late = fmt_late(delta) if delta > 0 else '~0'
             rec = {
                 'Last Name': last_name,
                 'First Name': first_name,
@@ -387,7 +458,7 @@ def _apply_late_penalties(df, due_dt, days_grace, penalty, assignment_name, verb
                 'Lab Section': section or '',
                 'School Email': row[email_col] if email_col else '',
                 'Score Date': score_date_str,
-                'How Late': fmt_late(delta),
+                'How Late': how_late,
                 'Original Score': round(float(original_score), 4) if not pd.isna(original_score) else '',
                 'Penalty Factor': round(factor, 4),
                 'Applied Score': round(penalized_score, 4) if not pd.isna(penalized_score) else '',
@@ -396,6 +467,13 @@ def _apply_late_penalties(df, due_dt, days_grace, penalty, assignment_name, verb
         else:
             factor = 1.0
             status = 'on time'
+            # In two-report mode, ensure we write the deadlined score if lifted is lower
+            if deadlined_scores is not None and dl_val > 0 and not pd.isna(original_score):
+                try:
+                    if float(original_score) < dl_val - 0.01:
+                        df.at[idx, score_col] = dl_val
+                except (TypeError, ValueError):
+                    pass
 
         penalized_for_rec = penalized_score if delta > 0 else original_score
         audit_rec = {
@@ -563,7 +641,6 @@ def run_revert(pattern, lecture_files, original_files, quiet=False, weights_csv=
             'days_grace': days_grace,
             'hours_grace': hours_grace,
             'penalty': penalty,
-            'grace_limit': grace_limit,
             'no_penalty_ids': sorted(no_penalty_ids) if no_penalty_ids else [],
         }
         for aname, recs in all_audit_records.items():
@@ -671,8 +748,9 @@ def _apply_best_one_of(df, verbose=True):
 def run_assignment(deadline_input, lecture_files=None, output_dir='.',
                    quiet=False, due_dates_csv=None, days_grace=0, hours_grace=0,
                    penalty=0.2, date_audit=False, force=False,
-                   best_one_of=False, due=None, name=None, grace_limit=None,
-                   no_penalty_ids=None, weights_csv=None, audit_log=None):
+                   best_one_of=False, due=None, name=None,
+                   no_penalty_ids=None, weights_csv=None, audit_log=None,
+                   deadlined_input=None, aliases=None):
     """
     Process zyBooks assignment report CSV(s), apply late penalties from a
     due-dates table, and update BBLearn lecture gradebooks.
@@ -717,22 +795,74 @@ def run_assignment(deadline_input, lecture_files=None, output_dir='.',
         print(f"Due date: {fallback_due_dt.tz_convert(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
         print(f"Late penalty: {penalty * 100:.0f}%  |  Grace period: {days_grace}d {hours_grace}h")
 
-    if deadline_path.is_file():
-        derived = assignment_name_from_path(deadline_path)
+    # In two-report mode (--lifted), work_items come from the lifted file/dir;
+    # deadline_path is the deadlined report used only for score comparison.
+    # In normal mode, work_items come from deadline_path directly.
+    if deadlined_input:
+        process_path = Path(deadlined_input)
+        if not process_path.exists():
+            print(f"ERROR: --lifted path not found: {deadlined_input}")
+            sys.exit(1)
+    else:
+        process_path = deadline_path
+
+    # Derive assignment name(s) from the deadlined file (standard zyBooks filename);
+    # use process_path (lifted or same) for the actual data to load.
+    name_source = deadline_path if deadlined_input else process_path
+
+    if process_path.is_file():
+        derived = assignment_name_from_path(name_source)
         aname = name if name else derived
-        work_items = [(deadline_path, aname)]
-        print(f"\nSingle file: {deadline_path.name}")
+        work_items = [(process_path, aname)]
+        print(f"\nSingle file: {process_path.name}")
         if name:
             print(f"Assignment name override: '{name}'")
     else:
         if name:
             print(f"WARNING: --name is ignored when processing a directory")
-        csvs = sorted(deadline_path.glob('*.csv'))
+        csvs = sorted(process_path.glob('*.csv'))
         if not csvs:
-            print(f"\nERROR: No CSV files found in: {deadline_input}")
+            print(f"\nERROR: No CSV files found in: {process_path}")
             sys.exit(1)
-        work_items = [(f, assignment_name_from_path(f)) for f in csvs]
-        print(f"\nFound {len(work_items)} file(s) in: {deadline_input}")
+        # Match each lifted file to the corresponding deadlined file by name for name derivation
+        name_source_dir = deadline_path if deadlined_input else None
+        work_items = []
+        for f in csvs:
+            if name_source_dir:
+                dl_match = name_source_dir / f.name
+                aname = assignment_name_from_path(dl_match if dl_match.exists() else f)
+            else:
+                aname = assignment_name_from_path(f)
+            work_items.append((f, aname))
+        print(f"\nFound {len(work_items)} file(s) in: {process_path}")
+
+    # Load deadlined scores for two-report mode
+    # Maps assignment_name -> (id_scores, username_scores); empty means timestamp mode
+    deadlined_scores_map = {}
+    if deadlined_input:
+        if deadline_path.is_file():
+            if len(work_items) != 1:
+                print("ERROR: --lifted with a single deadlined file only works with a single lifted file")
+                sys.exit(1)
+            try:
+                deadlined_scores_map[work_items[0][1]] = _load_deadlined_scores(deadline_path)
+                print(f"Two-report mode: deadlined {deadline_path.name} vs lifted {process_path.name}")
+            except ValueError as e:
+                print(f"ERROR: {e}")
+                sys.exit(1)
+        else:
+            # Directory: match deadlined files to lifted files by filename
+            for assignment_file, aname in work_items:
+                dl_file = deadline_path / assignment_file.name
+                if dl_file.exists():
+                    try:
+                        deadlined_scores_map[aname] = _load_deadlined_scores(dl_file)
+                    except ValueError as e:
+                        print(f"WARNING: Could not load deadlined scores for {aname}: {e}")
+                else:
+                    print(f"WARNING: No deadlined file for {aname} ({dl_file.name}) — using timestamp mode")
+            if deadlined_scores_map:
+                print(f"Two-report mode: {len(deadlined_scores_map)} deadlined report(s) loaded")
 
     verbose = not quiet
 
@@ -808,8 +938,9 @@ def run_assignment(deadline_input, lecture_files=None, output_dir='.',
                                 section_due_dates=section_due_dates,
                                 date_audit=date_audit,
                                 hours_grace=hours_grace,
-                                grace_limit=grace_limit,
+
                                 no_penalty_ids=no_penalty_ids,
+                                deadlined_scores=deadlined_scores_map.get(assignment_name),
                             )
                             if late_recs:
                                 all_late_records[assignment_name] = late_recs
@@ -823,8 +954,9 @@ def run_assignment(deadline_input, lecture_files=None, output_dir='.',
                                 assignment_name, verbose=verbose,
                                 date_audit=date_audit,
                                 hours_grace=hours_grace,
-                                grace_limit=grace_limit,
+
                                 no_penalty_ids=no_penalty_ids,
+                                deadlined_scores=deadlined_scores_map.get(assignment_name),
                             )
                             if late_recs:
                                 all_late_records[assignment_name] = late_recs
@@ -841,6 +973,7 @@ def run_assignment(deadline_input, lecture_files=None, output_dir='.',
                         hours_grace=hours_grace,
                         grace_limit=grace_limit,
                         no_penalty_ids=no_penalty_ids,
+                        deadlined_scores=deadlined_scores_map.get(assignment_name),
                     )
                     if late_recs:
                         all_late_records[assignment_name] = late_recs
@@ -913,7 +1046,7 @@ def run_assignment(deadline_input, lecture_files=None, output_dir='.',
                 print(f"\n   WARNING: No 'Percent score' column for '{assignment_name}' — skipping")
                 continue
 
-            score_map, id_map, name_map = build_student_score_maps(df, score_col)
+            score_map, id_map, name_map = build_student_score_maps(df, score_col, aliases=aliases)
 
             print(f"\n   Assignment: {assignment_name}")
             for lecture_name, lecture_df in lecture_dfs.items():

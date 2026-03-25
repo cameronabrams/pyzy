@@ -19,15 +19,17 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Example:
-    pyzy assignment -d report.csv
-    pyzy assignment -d reports/ --due-dates-csv DueDates.csv --days-grace 1 --penalty 0.2 -l lecA.csv lecB.csv
+    pyzy assignment report.csv
+    pyzy assignment reports/ --due-dates-csv DueDates.csv --penalty 0.2 -l lecA.csv lecB.csv
+    pyzy assignment W3_PA_deadlined.csv --lifted W3_PA_lifted.csv --due-dates-csv DueDates.csv --penalty 0.5 -l lec*.csv
 """,
     )
     assignment_parser.add_argument(
-        '--deadline', '-d', default=None,
+        'input', nargs='?', default=None,
         metavar='FILE_OR_DIR',
-        help='zyBooks assignment report CSV, or a directory of them '
-             '(required unless --revert is used)',
+        help='zyBooks assignment report CSV or directory. In two-report mode (--lifted), '
+             'this is the deadlined report (pulled with grace-adjusted deadline active). '
+             'Required unless --revert is used.',
     )
     assignment_parser.add_argument(
         '--lecture', '-l', nargs='+', default=None,
@@ -89,11 +91,6 @@ Example:
         help='Student ID(s) exempt from late penalties (score kept as-is regardless of lateness)',
     )
     assignment_parser.add_argument(
-        '--grace-limit', type=float, default=None,
-        metavar='DAYS',
-        help='Zero out scores for submissions more than this many days late (default: no limit)',
-    )
-    assignment_parser.add_argument(
         '--best-one-of', action='store_true',
         help='Replace Percent score with the best single component column percentage '
              '(component columns match <int>.<int>, e.g. "19.1 - Lab (10)")',
@@ -110,6 +107,21 @@ Example:
         metavar='NAME',
         help='Override the derived assignment name used as the gradebook column target '
              '(e.g. "W3 PA"). Only applies when processing a single file.',
+    )
+    assignment_parser.add_argument(
+        '--aliases', default=None,
+        metavar='FILE',
+        help='CSV mapping zyBooks usernames to DrexelOne usernames. '
+             'Columns: zybooks_username, username  (student_id optional).',
+    )
+    assignment_parser.add_argument(
+        '--lifted', default=None,
+        metavar='PATH',
+        help='Lifted zyBooks report (file or directory) for two-report mode. '
+             'When provided, the positional input is treated as the deadlined report and '
+             'lateness is determined by score comparison: a student is late only if their '
+             'lifted score exceeds their deadlined score. '
+             '--days-grace and --hours-grace are ignored (grace is baked into the deadlined report).',
     )
     assignment_parser.add_argument(
         '--quiet', '-q', action='store_true',
@@ -256,6 +268,12 @@ Late penalty (--due): applied to the selected submission (max/recent only).
         '--no-penalty', nargs='+', default=None,
         metavar='STUDENT_ID',
         help='Student ID(s) exempt from late penalties (looked up via gradebook)',
+    )
+    activity_parser.add_argument(
+        '--aliases', default=None,
+        metavar='FILE',
+        help='CSV mapping zyBooks usernames to DrexelOne usernames. '
+             'Columns: zybooks_username, username  (student_id optional).',
     )
     activity_parser.add_argument(
         '--audit-log', default='pyzy_audit',
@@ -441,6 +459,8 @@ Example:
 
 
 def main(argv=None):
+    from .common import load_aliases_csv  # noqa: F401 (used in dispatch below)
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -463,13 +483,13 @@ def main(argv=None):
                 quiet=args.quiet,
                 weights_csv=args.weights_csv,
             )
-        elif not args.deadline:
-            print("ERROR: --deadline is required (or use --revert for undo mode)")
+        elif not args.input:
+            print("ERROR: input file/directory is required (or use --revert for undo mode)")
             sys.exit(1)
         else:
             from .assignment import run_assignment
             run_assignment(
-                deadline_input=args.deadline,
+                deadline_input=args.input,
                 lecture_files=args.lecture,
                 output_dir=args.output_dir,
                 quiet=args.quiet,
@@ -482,10 +502,11 @@ def main(argv=None):
                 best_one_of=args.best_one_of,
                 due=args.due,
                 name=args.name,
-                grace_limit=args.grace_limit,
                 no_penalty_ids=args.no_penalty,
                 weights_csv=args.weights_csv,
                 audit_log=_make_audit_log(args.audit_log),
+                deadlined_input=args.lifted,
+                aliases=load_aliases_csv(args.aliases) if args.aliases else None,
             )
     elif args.command == 'merge':
         from .merge import run_merge
@@ -516,6 +537,7 @@ def main(argv=None):
             weights_csv=args.weights_csv,
             no_penalty_ids=args.no_penalty,
             audit_log=_make_audit_log(args.audit_log),
+            aliases=load_aliases_csv(args.aliases) if args.aliases else None,
         )
     elif args.command == 'late-adjust':
         late_files = args.late or []

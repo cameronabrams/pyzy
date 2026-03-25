@@ -21,6 +21,7 @@ from .common import (
     find_name_columns,
     find_student_id_column,
     fmt_late,
+    load_aliases_csv,
     load_weights_csv,
     middle_name_matched as _middle_name_matched,
     normalize_student_id,
@@ -105,7 +106,8 @@ def _print_late_report(late_df, due_dt):
 
 
 def parse_activity_report(filepath, verbose=True, due_date=None, select='max', grace_limit=None,
-                          no_penalty_emails=None, days_grace=0, hours_grace=0, penalty=0.2):
+                          no_penalty_emails=None, days_grace=0, hours_grace=0, penalty=0.2,
+                          aliases=None):
     """
     Parse a zyBooks activity report CSV and compute per-student scores.
 
@@ -224,6 +226,8 @@ def parse_activity_report(filepath, verbose=True, due_date=None, select='max', g
 
     best['Percent'] = (best[score_col] / best['Max score'] * 100).round(2)
     best['Username'] = best['Email'].apply(extract_username_from_email)
+    if aliases:
+        best['Username'] = best['Username'].apply(lambda u: aliases.get(u, u))
     best = best.sort_values(['Last name', 'First name']).reset_index(drop=True)
 
     if verbose:
@@ -318,7 +322,8 @@ def apply_scores_to_gradebook(df, score_map, column_pattern, verbose=True,
 
 def run_activity(input_files, lecture_files, column_names, output_dir='.', quiet=False,
                  due_date=None, select='max', force=False, grace_limit=None, penalty=0.2,
-                 weights_csv=None, no_penalty_ids=None, audit_log=None, days_grace=0, hours_grace=0):
+                 weights_csv=None, no_penalty_ids=None, audit_log=None, days_grace=0, hours_grace=0,
+                 aliases=None):
     """
     Run the activity report workflow for one or more reports.
 
@@ -378,9 +383,9 @@ def run_activity(input_files, lecture_files, column_names, output_dir='.', quiet
         'no_penalty_ids': sorted(norm_ids) if norm_ids else [],
     }
     if aggregate:
-        _run_aggregated(input_files, lecture_files, column_names[0], out, verbose, due_date, select, force=force, grace_limit=grace_limit, penalty=penalty, weights=weights, no_penalty_ids=norm_ids, audit_log=audit_log, args_dict=args_dict, days_grace=days_grace, hours_grace=hours_grace)
+        _run_aggregated(input_files, lecture_files, column_names[0], out, verbose, due_date, select, force=force, grace_limit=grace_limit, penalty=penalty, weights=weights, no_penalty_ids=norm_ids, audit_log=audit_log, args_dict=args_dict, days_grace=days_grace, hours_grace=hours_grace, aliases=aliases)
     else:
-        _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date, select, force=force, grace_limit=grace_limit, penalty=penalty, weights=weights, no_penalty_ids=norm_ids, audit_log=audit_log, args_dict=args_dict, days_grace=days_grace, hours_grace=hours_grace)
+        _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date, select, force=force, grace_limit=grace_limit, penalty=penalty, weights=weights, no_penalty_ids=norm_ids, audit_log=audit_log, args_dict=args_dict, days_grace=days_grace, hours_grace=hours_grace, aliases=aliases)
 
     print("\nDone!")
 
@@ -514,8 +519,8 @@ def _dedup_late_records(records):
             by_email[email] = rec
         else:
             try:
-                curr = float(rec.get('Applied Score') or 0)
-                best_so_far = float(prev.get('Applied Score') or 0)
+                curr = float(rec.get('Original Score') or 0)
+                best_so_far = float(prev.get('Original Score') or 0)
                 if curr > best_so_far:
                     by_email[email] = rec
             except (TypeError, ValueError):
@@ -637,7 +642,7 @@ def _write_orphan_report(score_map, all_lecture_usernames, label, out):
               f"in any gradebook — see {orphaned_path}")
 
 
-def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_date=None, select='max', force=False, grace_limit=None, penalty=0.2, weights=None, no_penalty_ids=None, audit_log=None, args_dict=None, days_grace=0, hours_grace=0):
+def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_date=None, select='max', force=False, grace_limit=None, penalty=0.2, weights=None, no_penalty_ids=None, audit_log=None, args_dict=None, days_grace=0, hours_grace=0, aliases=None):
     """Aggregate multiple reports into a single column, keeping max score per student."""
     n_activities = len(input_files)
 
@@ -659,7 +664,7 @@ def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_d
         filepath = Path(input_file)
         print(f"\n   Report: {filepath.name}")
 
-        best = parse_activity_report(filepath, verbose=verbose, due_date=due_date, select=select, grace_limit=grace_limit, no_penalty_emails=exempt_usernames, days_grace=days_grace, hours_grace=hours_grace, penalty=penalty)
+        best = parse_activity_report(filepath, verbose=verbose, due_date=due_date, select=select, grace_limit=grace_limit, no_penalty_emails=exempt_usernames, days_grace=days_grace, hours_grace=hours_grace, penalty=penalty, aliases=aliases)
 
         if due_dt is not None:
             recs = _build_late_records(best, due_dt, gradebook_dfs, days_grace=days_grace, hours_grace=hours_grace)
@@ -681,27 +686,31 @@ def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_d
         for _, row in best.iterrows():
             username = row['Username']
             pct = row['Percent']
+            raw_pct = (row['Score'] / row['Max score'] * 100) if row['Max score'] else 0
 
             if username:
                 if username in combined:
-                    combined[username]['max_score'] = max(combined[username]['max_score'], pct)
                     combined[username]['count'] += 1
+                    if raw_pct > combined[username]['raw_pct']:
+                        combined[username]['raw_pct'] = raw_pct
+                        combined[username]['max_score'] = pct
                 else:
-                    combined[username] = {'max_score': pct, 'count': 1}
+                    combined[username] = {'raw_pct': raw_pct, 'max_score': pct, 'count': 1}
 
             if first_col and last_col:
                 first = str(row[first_col]).strip().lower() if pd.notna(row[first_col]) else ''
                 last = str(row[last_col]).strip().lower() if pd.notna(row[last_col]) else ''
                 if first and last:
                     key = (last, first)
-                    name_combined[key] = max(name_combined.get(key, 0), pct)
+                    if key not in name_combined or raw_pct > name_combined[key]['raw_pct']:
+                        name_combined[key] = {'raw_pct': raw_pct, 'score': pct}
 
     if verbose:
         print(f"\n   Aggregated {len(combined)} students across {n_activities} reports")
 
     score_map = {u: v['max_score'] for u, v in combined.items()}
     count_map = {u: v['count'] for u, v in combined.items()}
-    name_score_map = name_combined
+    name_score_map = {k: v['score'] for k, v in name_combined.items()}
 
     if all_late_recs_flat:
         deduped = _dedup_late_records(all_late_recs_flat)
@@ -758,7 +767,7 @@ def _run_aggregated(input_files, lecture_files, column_name, out, verbose, due_d
         print(f"\nAudit log updated: {audit_log.directory}")
 
 
-def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date=None, select='max', force=False, grace_limit=None, penalty=0.2, weights=None, no_penalty_ids=None, audit_log=None, args_dict=None, days_grace=0, hours_grace=0):
+def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_date=None, select='max', force=False, grace_limit=None, penalty=0.2, weights=None, no_penalty_ids=None, audit_log=None, args_dict=None, days_grace=0, hours_grace=0, aliases=None):
     """Each report gets its own column in the gradebook."""
     lecture_paths = {Path(fp).name: Path(fp) for fp in lecture_files}
     gradebooks = {name: read_csv_with_trailing_comma_fix(fp) for name, fp in lecture_paths.items()}
@@ -774,7 +783,7 @@ def _run_per_column(input_files, lecture_files, column_names, out, verbose, due_
         filepath = Path(input_file)
         print(f"\n   Report: {filepath.name}  ->  column '{column_name}'")
 
-        best = parse_activity_report(filepath, verbose=verbose, due_date=due_date, select=select, grace_limit=grace_limit, no_penalty_emails=exempt_usernames, days_grace=days_grace, hours_grace=hours_grace, penalty=penalty)
+        best = parse_activity_report(filepath, verbose=verbose, due_date=due_date, select=select, grace_limit=grace_limit, no_penalty_emails=exempt_usernames, days_grace=days_grace, hours_grace=hours_grace, penalty=penalty, aliases=aliases)
 
         if due_dt is not None:
             recs = _build_late_records(best, due_dt, gradebooks, days_grace=days_grace, hours_grace=hours_grace)

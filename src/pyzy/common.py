@@ -119,7 +119,7 @@ def find_name_columns(df):
     return first_col, last_col
 
 
-def build_student_score_maps(student_df, score_col):
+def build_student_score_maps(student_df, score_col, aliases=None):
     """
     Build username, student-ID, and name lookup maps from a student DataFrame.
 
@@ -149,6 +149,8 @@ def build_student_score_maps(student_df, score_col):
         if email_col:
             username = extract_username_from_email(row[email_col])
             if username:
+                if aliases and username in aliases:
+                    username = aliases[username]
                 username_map[username] = score
                 # first.middle.last -> also register first.last and (last, first)
                 parts = username.split('.')
@@ -226,6 +228,23 @@ def resolve_column(df, pattern):
             f"{', '.join(matches)}"
         )
     return matches[0]
+
+
+def load_aliases_csv(path):
+    """
+    Load a username aliases CSV mapping zyBooks usernames to DrexelOne usernames.
+
+    Expected columns: zybooks_username, username  (student_id optional, for reference)
+    Returns: {zybooks_username_lower: drexel_username_lower}
+    """
+    df = pd.read_csv(path, encoding='utf-8-sig')
+    aliases = {}
+    for _, row in df.iterrows():
+        zy = str(row.get('zybooks_username', '') or '').strip().lower()
+        un = str(row.get('username', '') or '').strip().lower()
+        if zy and un:
+            aliases[zy] = un
+    return aliases
 
 
 def load_weights_csv(path):
